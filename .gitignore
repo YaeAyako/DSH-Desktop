@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+
+# npm / electron 下载缓存
+.npm-cache/
+.electron-cache/
+
+# 构建产物
+release/
+release2/
+dist/
+out/
+
+# 本地携带的 Node 运行时（体积大，需重新获取时：把本机 node.exe 复制到 vendor/node/node.exe）
+vendor/
+
+# 日志
+*.log
+
+# 本地配置与密钥（兜底：这些本就不该出现在项目里，API Key 在 ~/.dsh/.credentials.yaml）
+dsh-desktop.config.json
+.env
+.credentials.yaml
