@@ -26,6 +26,7 @@
       "!.electron-cache/**",
       "!build/**"
     ],
+    "afterPack": "build/afterPack.js",
     "directories": {
       "output": "release"
     },

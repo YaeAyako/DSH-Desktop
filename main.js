@@ -9,6 +9,14 @@
 // 端口策略：默认使用 3080（与 `dsh web` 一致）。启动前先探测该端口是否已有一个
 // harness 在跑：若在，则直接复用它（避免两个后端同时写同一个 ~/.dsh 而损坏会话日志）；
 // 若不在，才自己启动一个。端口被非 harness 进程占用时，回退到 --port 0（系统分配）。
+//
+// 启动流程（v2）：
+//   1. 并行执行「联网版本自检」与「后端启动」；版本自检限定短超时，失败按“无更新”处理，
+//      绝不让用户明显感到启动变慢。
+//   2. 后端就绪 + 版本结果齐备后决策：
+//        - 无更新（或自检失败）→ 不显示启动画面，直接进入应用（加载 Web UI）。
+//        - 有更新 → 只显示启动画面（「更新后端 / 直接进入应用」），用户选择后才加载 Web UI，
+//          避免复用已有后端时启动画面被 Web UI 的加载页抢走。
 
 const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const { spawn, spawnSync, execFileSync } = require('child_process');
@@ -19,11 +27,23 @@ const os = require('os');
 const BACKEND_BIN = path.join(__dirname, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 const DEFAULT_DSH_HOME = path.join(os.homedir(), '.dsh');
 const BOOT_TIMEOUT_MS = 90 * 1000;
+// 版本自检超时：要求“尽可能快”，超时即视为无更新，直接进入应用。
+const VERSION_CHECK_TIMEOUT_MS = 2000;
+// 后端未就绪 / 版本未决时，延迟一段时间才显示启动画面，避免快速启动场景下画面闪现。
+const BOOT_SPLASH_DELAY_MS = 400;
 
-// 当前打包的 @deepseek-ai/dsh 版本（用于启动画面的“检查更新”对比）。
-const CURRENT_DSH_VERSION = (() => {
+// 当前打包的 @deepseek-ai/dsh 版本（用于启动画面的“更新后端”对比）。
+// 环境变量 DSH_DESKTOP_FAKE_VERSION 可临时覆盖（仅用于测试更新流程）。
+const CURRENT_DSH_VERSION = process.env.DSH_DESKTOP_FAKE_VERSION || (() => {
   try {
     return require(path.join(__dirname, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')).version;
+  } catch {
+    return 'unknown';
+  }
+})();
+const APP_VERSION = (() => {
+  try {
+    return require(path.join(__dirname, 'package.json')).version;
   } catch {
     return 'unknown';
   }
@@ -39,6 +59,11 @@ let stdoutBuf = '';
 let stderrBuf = '';
 let logStream = null;
 let splashWindow = null;
+// v2 启动状态机
+let backendReady = false;
+let updateResult = null; // { latest?, error? }；null 表示自检未完成
+let decided = false;     // 是否已做出“进入应用 / 显示更新画面”的决策
+let bootSplashTimer = null;
 
 function log(...parts) {
   const line = `[${new Date().toISOString()}] ${parts.join(' ')}`;
@@ -67,7 +92,7 @@ function resolveNodeBinary() {
   const candidates = [
     process.env.DSH_DESKTOP_NODE,
     cfg.node,
-    // 打包后：extraResources 里随包携带的独立 Node（开箱即用，无需用户装 Node）
+    // 打包后：随包携带的独立 Node（开箱即用，无需用户装 Node）
     path.join(process.resourcesPath, 'node', 'node.exe'),
     // 开发期：项目内 vendor/node
     path.join(__dirname, 'vendor', 'node', 'node.exe'),
@@ -84,6 +109,20 @@ function resolveNodeBinary() {
     } catch {}
   }
   return 'node';
+}
+
+// 定位 npm-cli.js（更新后端用）：
+//   - 打包后：extraResources 拷到 resources/npm（不受依赖 prune 影响）；
+//   - 开发期：项目内 vendor/node/node_modules/npm。
+function resolveNpmCli() {
+  const candidates = [
+    path.join(process.resourcesPath, 'npm', 'bin', 'npm-cli.js'),
+    path.join(__dirname, 'vendor', 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
 }
 
 function resolveWorkspace() {
@@ -211,16 +250,62 @@ function spawnBackend(port, fallbackOnBind) {
   });
 }
 
+// v2：后端就绪。设置状态并尝试决策（等版本自检结果齐备）。
 function onBackendReady(url) {
   log('backend ready:', url);
   if (bootTimer) {
     clearTimeout(bootTimer);
     bootTimer = null;
   }
-  if (mainWindow) {
-    mainWindow.loadURL(url);
+  backendReady = true;
+  backendUrl = url;
+  backendOrigin = new URL(url).origin;
+  if (bootSplashTimer) {
+    clearTimeout(bootSplashTimer);
+    bootSplashTimer = null;
+  }
+  // 后端已就绪但版本自检还没出结果：延迟显示一个短暂的等待画面（给用户反馈，避免“没反应”），
+  // 快速场景（几百 ms 内完成自检）不会闪现。
+  if (!updateResult && !decided) {
+    bootSplashTimer = setTimeout(() => {
+      if (!updateResult && !decided && !splashWindow) showSplash('正在检查更新…');
+    }, BOOT_SPLASH_DELAY_MS);
+  }
+  maybeDecide();
+}
+
+// v2：后端就绪 + 版本结果齐备后，一次性决策。
+function maybeDecide() {
+  if (decided) return;
+  if (!backendReady || !updateResult) return;
+  decided = true;
+  if (bootSplashTimer) {
+    clearTimeout(bootSplashTimer);
+    bootSplashTimer = null;
+  }
+  const latest = updateResult.latest;
+  const hasUpdate = !!latest && latest !== CURRENT_DSH_VERSION;
+  if (hasUpdate) {
+    log('update available:', CURRENT_DSH_VERSION, '->', latest);
+    closeSplash();
+    showSplash(`检测到后端新版本 v${latest}\n当前版本 v${CURRENT_DSH_VERSION}`, {
+      version: CURRENT_DSH_VERSION,
+      withActions: true,
+    });
   } else {
-    createWindow(url);
+    log('no update (or check failed); entering app');
+    closeSplash();
+    enterApp();
+  }
+}
+
+// v2：加载 Web UI（只有用户选择“直接进入应用”或“无更新直接进入”时才调用）。
+function enterApp() {
+  if (!backendUrl) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.loadURL(backendUrl);
+  } else {
+    createWindow(backendUrl);
   }
 }
 
@@ -295,38 +380,40 @@ function createWindow(url) {
   });
 }
 
-// 启动画面：一个无边框小窗口，显示加载动画、版本信息与可选的操作按钮。
+// 启动画面：一个无边框小窗口。两种形态：
+//   - 等待态（无按钮）：后端启动中 / 版本自检中。
+//   - 更新态（有按钮）：「更新后端 / 直接进入应用」。
 function splashHtml(msg, opts = {}) {
   const { version = '', withActions = false } = opts;
   const versionLine = version ? `<div class="ver">v${version}</div>` : '';
   const actions = withActions ? `<div class="actions">
-<button id="checkBtn">检查更新</button>
+<button id="updateBtn">更新后端</button>
 <button id="goBtn" class="primary">直接进入应用</button>
 </div>` : '';
   const script = withActions ? `<script>
 const statusEl = document.getElementById('status');
-const checkBtn = document.getElementById('checkBtn');
+const updateBtn = document.getElementById('updateBtn');
 const goBtn = document.getElementById('goBtn');
-checkBtn.addEventListener('click', async () => {
-  checkBtn.disabled = true;
-  statusEl.textContent = '正在检查更新…';
+updateBtn.addEventListener('click', async () => {
+  updateBtn.disabled = true;
+  goBtn.disabled = true;
+  statusEl.textContent = '正在更新后端…（视网络情况可能需要几分钟）';
   try {
-    const r = await window.dshSplash.checkUpdate();
-    if (r.error) {
-      statusEl.textContent = '检查更新失败：' + r.error;
-    } else if (r.latest && r.latest !== r.current) {
-      statusEl.innerHTML = '发现新版本 v' + r.latest + '，<a href="#" id="dl">前往下载</a>';
-      document.getElementById('dl').addEventListener('click', (e) => {
-        e.preventDefault();
-        window.open('${GITHUB_RELEASES_URL}');
-      });
+    const r = await window.dshSplash.updateBackend();
+    if (r && r.ok) {
+      statusEl.innerHTML = '后端已更新：v' + (r.from || '?') + ' → v' + (r.to || '?') + '。<br>请重启应用生效（若浏览器/Web 版 Harness 正在运行，请先关闭它）。';
+      updateBtn.textContent = '✓ 更新完成';
+      goBtn.disabled = false;
     } else {
-      statusEl.textContent = '已是最新版本 v' + (r.latest || r.current);
+      statusEl.textContent = '更新失败：' + ((r && r.error) || '未知错误');
+      updateBtn.disabled = false;
+      goBtn.disabled = false;
     }
   } catch (err) {
-    statusEl.textContent = '检查更新失败';
+    statusEl.textContent = '更新失败：' + (err && err.message ? err.message : String(err));
+    updateBtn.disabled = false;
+    goBtn.disabled = false;
   }
-  checkBtn.disabled = false;
 });
 goBtn.addEventListener('click', () => { window.dshSplash.proceed(); });
 </script>` : '';
@@ -377,7 +464,7 @@ function showSplash(msg, opts = {}) {
       preload: path.join(__dirname, 'preload.js'),
     },
   });
-  splashWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashHtml(msg, { version: CURRENT_DSH_VERSION, withActions })));
+  splashWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashHtml(msg, opts)));
   splashWindow.webContents.setWindowOpenHandler(({ url: u }) => {
     if (/^https?:/i.test(u)) shell.openExternal(u);
     return { action: 'deny' };
@@ -394,27 +481,105 @@ function closeSplash() {
   }
 }
 
+// 联网版本自检：并行请求多个 registry（官方 + 镜像），**第一个成功即返回**，
+// 不被慢/挂起的请求拖累；短超时兜底。失败返回 { error }，由决策逻辑按“无更新”处理，
+// 绝不让用户明显感到启动变慢。
 async function fetchLatestDshVersion() {
+  const urls = [
+    'https://registry.npmjs.org/@deepseek-ai/dsh/latest',
+    'https://registry.npmmirror.com/@deepseek-ai/dsh/latest',
+  ];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VERSION_CHECK_TIMEOUT_MS);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    const res = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh/latest', { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) return { error: 'HTTP ' + res.status };
-    const data = await res.json();
-    return { latest: data && typeof data.version === 'string' ? data.version : undefined };
+    const tasks = urls.map(async (u) => {
+      const res = await fetch(u, { signal: controller.signal });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data || typeof data.version !== 'string') throw new Error('bad payload');
+      return data.version;
+    });
+    return await new Promise((resolve) => {
+      let done = false;
+      let failed = 0;
+      for (const t of tasks) {
+        t.then(
+          (v) => { if (!done) { done = true; resolve({ latest: v }); } },
+          () => { failed += 1; if (failed === tasks.length && !done) { done = true; resolve({ error: 'all registries failed' }); } }
+        );
+      }
+    });
   } catch (e) {
     return { error: e.message };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// 启动画面的 IPC：检查更新 / 直接进入
+// v2：启动时快速版本自检（与后端启动并行），结果就绪后参与决策。
+async function checkVersionFast() {
+  const r = await fetchLatestDshVersion();
+  updateResult = r;
+  log('version check:', JSON.stringify(r));
+  maybeDecide();
+}
+
+// —— 更新后端：把 @deepseek-ai/dsh 升到最新版 ——
+// 注意：不盲目把“所有 @deepseek-ai/*”都升 @latest —— 某些包（如 dsh-invariants）的
+// npm dist-tag `latest` 指向旧版本，会把依赖树解析炸掉（ERESOLVE）。只更新核心后端
+// dsh，其余包保持 package.json 固定版本，npm 会自动解析 dsh 所需的依赖/peer。
+async function updateBackend() {
+  const appDir = __dirname;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(appDir, 'package.json'), 'utf8'));
+  } catch (e) {
+    return { ok: false, error: '无法读取 package.json：' + e.message };
+  }
+  const targets = ['@deepseek-ai/dsh'];
+  const npmCli = resolveNpmCli();
+  if (!npmCli) {
+    return { ok: false, error: '未找到 npm（vendor/node 中缺少 npm）' };
+  }
+  const nodeBin = resolveNodeBinary();
+  const args = [npmCli, 'install', '--no-audit', '--no-fund', '--save', ...targets.map((n) => n + '@latest')];
+  log('update backend:', nodeBin, args.join(' '));
+  const out = await runProcess(nodeBin, args, appDir);
+  if (out.code !== 0) {
+    log('update backend failed, code=' + out.code);
+    return { ok: false, error: (out.stderr || out.stdout).slice(-1200) || 'npm install 失败（退出码 ' + out.code + '）' };
+  }
+  let newVersion = '?';
+  try {
+    newVersion = require(path.join(appDir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')).version;
+  } catch {}
+  log('update backend done ->', newVersion);
+  return { ok: true, from: CURRENT_DSH_VERSION, to: newVersion };
+}
+
+function runProcess(bin, args, cwd) {
+  return new Promise((resolve) => {
+    const proc = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d; });
+    proc.stderr.on('data', (d) => { stderr += d; });
+    proc.on('error', (e) => resolve({ code: -1, stdout, stderr: String(e) }));
+    proc.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+// 启动画面的 IPC：版本自检 / 更新后端 / 直接进入
 ipcMain.handle('splash:check-update', async () => {
   const r = await fetchLatestDshVersion();
   return { current: CURRENT_DSH_VERSION, latest: r.latest, error: r.error };
 });
+ipcMain.handle('splash:update-backend', async () => {
+  return await updateBackend();
+});
 ipcMain.on('splash:proceed', () => {
-  if (mainWindow && !mainWindow.isDestroyed()) closeSplash();
+  closeSplash();
+  enterApp();
 });
 
 function stopBackend() {
@@ -457,8 +622,19 @@ app.whenReady().then(async () => {
   // 去掉菜单栏（不显示 Electron 默认的“查看 / 窗口”等菜单）。
   Menu.setApplicationMenu(null);
 
-  showSplash('正在启动后端…', { withActions: true });
-  await startBackend();
+  log('app version:', APP_VERSION);
+  log('dsh version :', CURRENT_DSH_VERSION);
+
+  // v2：并行「版本自检（快速）」+「后端启动」；二者就绪后由 maybeDecide 决策。
+  checkVersionFast();
+  startBackend();
+
+  // 后端启动 / 版本自检迟迟未完成时，延迟显示一个无按钮的等待画面（避免快速场景闪现）。
+  bootSplashTimer = setTimeout(() => {
+    if (decided || splashWindow) return;
+    if (!backendReady) showSplash('正在启动后端…');
+    else if (!updateResult) showSplash('正在检查更新…');
+  }, BOOT_SPLASH_DELAY_MS);
 
   bootTimer = setTimeout(() => {
     if (!backendUrl) {
