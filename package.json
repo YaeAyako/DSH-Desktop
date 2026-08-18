@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop",
   "productName": "DeepSeek Harness",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "DeepSeek Harness 桌面应用：独立窗口加载与 Web UI 完全一致的界面，自动启动后端，无需浏览器。",
   "author": "deepseek-v4-pro (via DeepSeek Harness)",
   "main": "main.js",
