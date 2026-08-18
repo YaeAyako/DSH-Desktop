@@ -10,7 +10,7 @@
 // harness 在跑：若在，则直接复用它（避免两个后端同时写同一个 ~/.dsh 而损坏会话日志）；
 // 若不在，才自己启动一个。端口被非 harness 进程占用时，回退到 --port 0（系统分配）。
 
-const { app, BrowserWindow, Menu, dialog, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const { spawn, spawnSync, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -19,6 +19,16 @@ const os = require('os');
 const BACKEND_BIN = path.join(__dirname, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 const DEFAULT_DSH_HOME = path.join(os.homedir(), '.dsh');
 const BOOT_TIMEOUT_MS = 90 * 1000;
+
+// 当前打包的 @deepseek-ai/dsh 版本（用于启动画面的“检查更新”对比）。
+const CURRENT_DSH_VERSION = (() => {
+  try {
+    return require(path.join(__dirname, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')).version;
+  } catch {
+    return 'unknown';
+  }
+})();
+const GITHUB_RELEASES_URL = 'https://github.com/YaeAyako/DSH-Desktop/releases';
 
 let backendProc = null;
 let backendUrl = null;
@@ -285,28 +295,74 @@ function createWindow(url) {
   });
 }
 
-// 启动画面：一个无边框小窗口，显示加载动画与状态文字。
-function splashHtml(msg) {
+// 启动画面：一个无边框小窗口，显示加载动画、版本信息与可选的操作按钮。
+function splashHtml(msg, opts = {}) {
+  const { version = '', withActions = false } = opts;
+  const versionLine = version ? `<div class="ver">v${version}</div>` : '';
+  const actions = withActions ? `<div class="actions">
+<button id="checkBtn">检查更新</button>
+<button id="goBtn" class="primary">直接进入应用</button>
+</div>` : '';
+  const script = withActions ? `<script>
+const statusEl = document.getElementById('status');
+const checkBtn = document.getElementById('checkBtn');
+const goBtn = document.getElementById('goBtn');
+checkBtn.addEventListener('click', async () => {
+  checkBtn.disabled = true;
+  statusEl.textContent = '正在检查更新…';
+  try {
+    const r = await window.dshSplash.checkUpdate();
+    if (r.error) {
+      statusEl.textContent = '检查更新失败：' + r.error;
+    } else if (r.latest && r.latest !== r.current) {
+      statusEl.innerHTML = '发现新版本 v' + r.latest + '，<a href="#" id="dl">前往下载</a>';
+      document.getElementById('dl').addEventListener('click', (e) => {
+        e.preventDefault();
+        window.open('${GITHUB_RELEASES_URL}');
+      });
+    } else {
+      statusEl.textContent = '已是最新版本 v' + (r.latest || r.current);
+    }
+  } catch (err) {
+    statusEl.textContent = '检查更新失败';
+  }
+  checkBtn.disabled = false;
+});
+goBtn.addEventListener('click', () => { window.dshSplash.proceed(); });
+</script>` : '';
   return `<!doctype html>
 <html><head><meta charset="utf-8"><style>
 html,body{margin:0;height:100%;background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;display:flex;align-items:center;justify-content:center;overflow:hidden;user-select:none;-webkit-app-region:drag;}
 .wrap{text-align:center;padding:0 28px;}
-.spinner{width:40px;height:40px;border:4px solid #30363d;border-top-color:#4d9fff;border-radius:50%;margin:0 auto 18px;animation:spin .8s linear infinite;}
+.spinner{width:40px;height:40px;border:4px solid #30363d;border-top-color:#4d9fff;border-radius:50%;margin:0 auto 16px;animation:spin .8s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg)}}
 .title{font-size:16px;font-weight:600;letter-spacing:.4px;}
-.msg{margin-top:12px;font-size:12.5px;color:#8b949e;line-height:1.55;white-space:pre-line;}
+.msg{margin-top:10px;font-size:12.5px;color:#8b949e;line-height:1.55;white-space:pre-line;}
+.ver{margin-top:8px;font-size:11px;color:#6e7681;}
+.status{margin-top:8px;font-size:12px;color:#4d9fff;min-height:16px;line-height:1.5;}
+.status a{color:#4d9fff;text-decoration:underline;}
+.actions{margin-top:16px;display:flex;gap:10px;justify-content:center;-webkit-app-region:no-drag;}
+button{font:inherit;font-size:12.5px;padding:7px 18px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e6edf3;cursor:pointer;}
+button:hover{background:#30363d;}
+button.primary{background:#4d9fff;border-color:#4d9fff;color:#0d1117;font-weight:600;}
+button.primary:hover{background:#6fb0ff;}
+button:disabled{opacity:.5;cursor:default;}
 </style></head><body><div class="wrap">
 <div class="spinner"></div>
 <div class="title">DeepSeek Harness</div>
 <div class="msg">${msg}</div>
-</div></body></html>`;
+${versionLine}
+<div class="status" id="status"></div>
+${actions}
+</div>${script}</body></html>`;
 }
 
-function showSplash(msg) {
+function showSplash(msg, opts = {}) {
   if (splashWindow) return;
+  const { withActions = false } = opts;
   splashWindow = new BrowserWindow({
-    width: 380,
-    height: 230,
+    width: 400,
+    height: withActions ? 320 : 230,
     frame: false,
     resizable: false,
     center: true,
@@ -314,9 +370,18 @@ function showSplash(msg) {
     skipTaskbar: true,
     backgroundColor: '#0d1117',
     show: false,
-    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      preload: path.join(__dirname, 'preload.js'),
+    },
   });
-  splashWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashHtml(msg)));
+  splashWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(splashHtml(msg, { version: CURRENT_DSH_VERSION, withActions })));
+  splashWindow.webContents.setWindowOpenHandler(({ url: u }) => {
+    if (/^https?:/i.test(u)) shell.openExternal(u);
+    return { action: 'deny' };
+  });
   splashWindow.once('ready-to-show', () => { if (splashWindow) splashWindow.show(); });
   splashWindow.on('closed', () => { splashWindow = null; });
 }
@@ -328,6 +393,29 @@ function closeSplash() {
     try { w.close(); } catch {}
   }
 }
+
+async function fetchLatestDshVersion() {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh/latest', { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return { error: 'HTTP ' + res.status };
+    const data = await res.json();
+    return { latest: data && typeof data.version === 'string' ? data.version : undefined };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// 启动画面的 IPC：检查更新 / 直接进入
+ipcMain.handle('splash:check-update', async () => {
+  const r = await fetchLatestDshVersion();
+  return { current: CURRENT_DSH_VERSION, latest: r.latest, error: r.error };
+});
+ipcMain.on('splash:proceed', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) closeSplash();
+});
 
 function stopBackend() {
   if (!backendProc) return;
@@ -369,7 +457,7 @@ app.whenReady().then(async () => {
   // 去掉菜单栏（不显示 Electron 默认的“查看 / 窗口”等菜单）。
   Menu.setApplicationMenu(null);
 
-  showSplash('正在启动后端…');
+  showSplash('正在启动后端…', { withActions: true });
   await startBackend();
 
   bootTimer = setTimeout(() => {
