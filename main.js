@@ -309,14 +309,29 @@ function enterApp() {
   }
 }
 
+// 把后端 stderr 里的常见失败翻译成友好提示（如插件缺依赖）；识别不到则返回 null。
+function friendlyBackendError(raw) {
+  const dep = raw.match(/Cannot find package '([^']+)' imported from ([^\n]+)/);
+  if (dep) {
+    return `缺少依赖：${dep[1]}\n来源：${dep[2]}\n\n请在该包目录执行：npm install ${dep[1]}\n（自定义插件缺依赖时，需在插件自己的目录安装，只装到应用目录无效）`;
+  }
+  const entry = raw.match(/failed to import loader entry\s+(\S+)\s*\(([^)]+)\)/);
+  if (entry) {
+    return `插件加载失败：${entry[1]}（${entry[2]}）\n请检查该插件依赖是否完整，详见下方日志。`;
+  }
+  return null;
+}
+
 function onBackendFailure(message) {
   log('backend failure:', message);
+  const friendly = friendlyBackendError(message);
   closeSplash();
   if (mainWindow) mainWindow.destroy();
   const logPath = logStream && logStream.path ? logStream.path : '';
+  const body = (friendly ? friendly + '\n\n————————————\n\n' : '') + message + (logPath ? `\n\n完整日志：${logPath}` : '');
   dialog.showErrorBox(
     'DeepSeek Harness 启动失败',
-    message + (logPath ? `\n\n完整日志：${logPath}` : '')
+    body
   );
   app.quit();
 }
