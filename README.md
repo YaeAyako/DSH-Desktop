@@ -16,6 +16,18 @@
 
 ---
 
+> ## ⚠️ Project status: **archived — no longer maintained**
+>
+> **DeepSeek Harness now ships an official desktop app** (macOS / Windows, since `0.2.0-rc.2`). It bundles Node **and pnpm**, manages plugins from its UI, and can install the `dsh` command from its menu bar — i.e. it natively fulfils the very goal this project existed for.
+>
+> Therefore **this repository is frozen at `v1.2.1` (pinned to dsh `0.2.0-rc.2`) and will receive no further updates.**
+>
+> 👉 **Please use the official desktop app instead:** <https://github.com/deepseek-ai/deepseek-harness>
+>
+> The last built artifact — `DeepSeek-Harness-1.2.1-win-x64.zip`, a fully pinned offline snapshot — is kept in this repository's Releases. See [UPGRADE.md](UPGRADE.md) for the full archive notice, what still works, and how to pick the project up yourself.
+
+---
+
 ## Why
 
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) ships a browser-based UI (`dsh web`). This project wraps that **same** UI in an Electron window so you can use it like any other desktop app:

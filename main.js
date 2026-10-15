@@ -1,5 +1,9 @@
 // DeepSeek Harness 桌面应用 —— Electron 壳
 //
+// ⚠️ 已归档（ARCHIVED）：官方已在 dsh 0.2.0-rc.2 推出官方桌面端（自带 Node 与 pnpm、
+//    内置插件管理、菜单栏可安装 dsh 命令），本项目赖以存在的目标已由官方原生满足，
+//    因此冻结在 v1.2.1 并停止维护。归档说明见 UPGRADE.md。
+//
 // 设计原则：Electron 只负责「壳」。真正的界面与后端仍是 DeepSeek Harness 本身：
 //   1. 用本机 Node 运行 @deepseek-ai/dsh 的 `web` profile（与 `dsh web` 完全等价）；
 //   2. 用一个原生 BrowserWindow 加载后端在同一套 Web UI（http://127.0.0.1:<port>）。
@@ -64,6 +68,7 @@ let backendReady = false;
 let updateResult = null; // { latest?, error? }；null 表示自检未完成
 let decided = false;     // 是否已做出“进入应用 / 显示更新画面”的决策
 let bootSplashTimer = null;
+let relaunchTimer = null;   // 更新后端成功后的自动重启定时器
 
 function log(...parts) {
   const line = `[${new Date().toISOString()}] ${parts.join(' ')}`;
@@ -420,8 +425,12 @@ updateBtn.addEventListener('click', async () => {
   try {
     const r = await window.dshSplash.updateBackend();
     if (r && r.ok) {
-      statusEl.innerHTML = '后端已更新：v' + (r.from || '?') + ' → v' + (r.to || '?') + '。<br>请重启应用生效（若浏览器/Web 版 Harness 正在运行，请先关闭它）。';
-      updateBtn.textContent = '✓ 更新完成';
+      if (r.upToDate) {
+        statusEl.textContent = '已是最新版本 v' + (r.to || '?') + '，无需更新。可点「直接进入应用」。';
+      } else {
+        statusEl.textContent = '✅ 后端已更新：v' + (r.from || '?') + ' → v' + (r.to || '?') + '，正在自动重启应用…';
+      }
+      updateBtn.textContent = '✓ 完成';
       goBtn.disabled = false;
     } else {
       statusEl.textContent = '更新失败：' + ((r && r.error) || '未知错误');
@@ -580,6 +589,26 @@ async function fetchDshPublishTime(version) {
   }
 }
 
+// 探测哪一个 npm registry 可达（并行探测、3 秒超时）：优先官方源，不可达则用国内镜像。
+// 目的：避免把不可达的源交给 npm 后陷入长时间重试。
+async function pickRegistry() {
+  const candidates = ['https://registry.npmjs.org', 'https://registry.npmmirror.com'];
+  const probes = candidates.map(async (base) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const res = await fetch(`${base}/@deepseek-ai%2fdsh`, { signal: controller.signal });
+      return res.ok ? base : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  const results = await Promise.all(probes);
+  return results[0] || results[1] || null;
+}
+
 // v2：启动时快速版本自检（与后端启动并行），结果就绪后参与决策。
 async function checkVersionFast() {
   const r = await fetchLatestDshVersion();
@@ -598,10 +627,14 @@ async function updateBackend(targetVersion) {
   const appDir = __dirname;
   const pkgPath = path.join(appDir, 'package.json');
   const lockPath = path.join(appDir, 'package-lock.json');
-  const nmPath = path.join(appDir, 'node_modules');
+  // 只备份/移走 @deepseek-ai 这个 scope，绝不整体重命名 node_modules：
+  // 运行中的应用自身就是 node_modules/electron/dist/electron.exe，
+  // Windows 会锁住进程映像，导致整个 node_modules 无法 rename（EPERM）。
+  const scopeDir = path.join(appDir, 'node_modules', '@deepseek-ai');
+  const scopeBakRoot = path.join(appDir, '.nm-scope-bak');
+  const scopeBak = path.join(scopeBakRoot, '@deepseek-ai');
   const pkgBak = pkgPath + '.update-bak';
   const lockBak = lockPath + '.update-bak';
-  const nmBak = path.join(appDir, 'node_modules.update-bak');
   const npmCli = resolveNpmCli();
   if (!npmCli) return { ok: false, error: '未找到 npm（resources/npm 或 vendor/node 中缺少 npm）' };
   const nodeBin = resolveNodeBinary();
@@ -614,27 +647,33 @@ async function updateBackend(targetVersion) {
     version = r.latest;
   }
   log('update backend -> target', version);
+  // 已是目标版本：无需重装（避免无谓的依赖重装与“同版本→同版本”的困惑显示）
+  if (version === CURRENT_DSH_VERSION) {
+    log('update backend: already up to date');
+    return { ok: true, from: CURRENT_DSH_VERSION, to: version, upToDate: true };
+  }
 
-  // 运行中的后端会锁住 node_modules 里的文件，先停掉再备份
+  // 运行中的后端会锁住 @deepseek-ai 里的文件，先停掉再备份
   stopBackend();
   const restore = () => {
     try {
-      if (fs.existsSync(nmBak)) {
-        if (fs.existsSync(nmPath)) fs.rmSync(nmPath, { recursive: true, force: true });
-        fs.renameSync(nmBak, nmPath);
+      if (fs.existsSync(scopeBak)) {
+        if (fs.existsSync(scopeDir)) fs.rmSync(scopeDir, { recursive: true, force: true });
+        fs.renameSync(scopeBak, scopeDir);
       }
-    } catch (e) { log('rollback node_modules failed:', e.message); }
+    } catch (e) { log('rollback @deepseek-ai failed:', e.message); }
     try { if (fs.existsSync(pkgBak)) { fs.copyFileSync(pkgBak, pkgPath); fs.rmSync(pkgBak, { force: true }); } } catch {}
     try { if (fs.existsSync(lockBak)) { fs.copyFileSync(lockBak, lockPath); fs.rmSync(lockBak, { force: true }); } } catch {}
   };
   try {
     fs.copyFileSync(pkgPath, pkgBak);
     if (fs.existsSync(lockPath)) fs.copyFileSync(lockPath, lockBak);
-    if (fs.existsSync(nmBak)) fs.rmSync(nmBak, { recursive: true, force: true });
-    if (fs.existsSync(nmPath)) fs.renameSync(nmPath, nmBak);
+    fs.mkdirSync(scopeBakRoot, { recursive: true });
+    if (fs.existsSync(scopeBak)) fs.rmSync(scopeBak, { recursive: true, force: true });
+    if (fs.existsSync(scopeDir)) fs.renameSync(scopeDir, scopeBak);
   } catch (e) {
     restore();
-    return { ok: false, error: '准备更新失败（备份/移走旧依赖）：' + e.message };
+    return { ok: false, error: '准备更新失败（备份/移走旧依赖）：' + e.message + '\n提示：若仍失败，请完全退出应用后重试。' };
   }
 
   // 依赖精简为仅主包 + 删除旧 lockfile —— 让 npm 干净重算整棵依赖树（避免在旧固定版本
@@ -658,12 +697,27 @@ async function updateBackend(targetVersion) {
   }
 
   // 干净安装：不带 --legacy-peer-deps，让 npm 自动解析并安装 peer 依赖。
-  // 网络韧性：官方源可能 ECONNRESET / SSL 失败，失败后自动切国内镜像重试一次。
-  const baseArgs = [npmCli, 'install', '--no-audit', '--no-fund', '--fetch-retries=5', ...beforeArgs];
+  // 网络韧性：安装前先探测哪一个 registry 可达并直接使用。官方源在国内常不可达，
+  // 若直接交给 npm，它会在反复重试（ECONNREFUSED × N）上耗掉几分钟，体验上就是“卡住”。
+  // 同时收紧重试上限，让不可达场景快速失败、及时切源。
+  const registry = await pickRegistry();
+  log('update backend: registry =', registry || '(npm default)');
+  const registryArgs = registry ? ['--registry=' + registry] : [];
+  const baseArgs = [
+    npmCli, 'install', '--no-audit', '--no-fund',
+    '--fetch-retries=2', '--fetch-retry-maxtimeout=10000',
+    ...beforeArgs, ...registryArgs,
+  ];
   let out = await runProcess(nodeBin, baseArgs, appDir, true);
-  if (out.code !== 0) {
-    log('npm install failed (code=' + out.code + '), retrying with npmmirror registry...');
-    out = await runProcess(nodeBin, [...baseArgs, '--registry=https://registry.npmmirror.com'], appDir, true);
+  if (out.code !== 0 && registry) {
+    const fallback = registry.includes('npmmirror') ? 'https://registry.npmjs.org' : 'https://registry.npmmirror.com';
+    log('npm install failed (code=' + out.code + '), retrying with', fallback);
+    out = await runProcess(
+      nodeBin,
+      [...baseArgs.filter((a) => !a.startsWith('--registry=')), '--registry=' + fallback],
+      appDir,
+      true
+    );
   }
   if (out.code !== 0) {
     restore();
@@ -688,7 +742,7 @@ async function updateBackend(targetVersion) {
   // 下次更新会重新生成这份清单，无需手工维护）
   const written = writeBackInstalledDeps(appDir, version, pkgPath);
   log('update backend ok:', CURRENT_DSH_VERSION, '->', version, '| deps written:', written);
-  try { fs.rmSync(nmBak, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(scopeBakRoot, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(pkgBak, { force: true }); } catch {}
   try { fs.rmSync(lockBak, { force: true }); } catch {}
   return { ok: true, from: CURRENT_DSH_VERSION, to: version };
@@ -782,8 +836,26 @@ ipcMain.handle('splash:check-update', async () => {
   return { current: CURRENT_DSH_VERSION, latest: r.latest, error: r.error };
 });
 ipcMain.handle('splash:update-backend', async () => {
-  return await updateBackend();
+  const r = await updateBackend();
+  // 真正发生了更新（非“已是最新”）才自动重启；留一点时间让启动画面展示提示。
+  if (r && r.ok && !r.upToDate) scheduleRelaunch();
+  return r;
 });
+
+// 更新成功后自动重启应用：relaunch + quit —— quit 会走 before-quit 停掉旧后端，
+// 退出流程结束后新实例才启动（单实例锁自然释放），因此无需用户手动重启。
+function scheduleRelaunch() {
+  if (relaunchTimer) return;
+  relaunchTimer = setTimeout(() => {
+    log('update done -> relaunching app');
+    try {
+      app.relaunch();
+    } catch (e) {
+      log('relaunch failed:', e.message);
+    }
+    app.quit();
+  }, 1800);
+}
 ipcMain.on('splash:proceed', () => {
   closeSplash();
   enterApp();

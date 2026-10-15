@@ -16,6 +16,18 @@
 
 ---
 
+> ## ⚠️ 项目状态：**已归档，停止维护**
+>
+> **DeepSeek Harness 官方已推出桌面端**（macOS / Windows，自 `0.2.0-rc.2` 起）。官方桌面端自带 Node **与 pnpm**、可在界面中管理插件，还能在菜单栏一键安装 `dsh` 命令 —— 本项目赖以存在的核心目标已被官方原生满足。
+>
+> 因此**本仓库冻结在 `v1.2.1`（锁定 dsh `0.2.0-rc.2`），不再进行任何更新。**
+>
+> 👉 **请改用官方桌面端：** <https://github.com/deepseek-ai/deepseek-harness>
+>
+> 最后构建的产物 `DeepSeek-Harness-1.2.1-win-x64.zip`（完全锁定依赖的离线快照）保留在本仓库 Releases 中。完整的归档说明、仍可用的能力、以及如何自行接手维护，见 [UPGRADE.md](UPGRADE.md)。
+
+---
+
 ## 为什么
 
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 自带一个基于浏览器的界面（`dsh web`）。本项目把**同一套**界面装进一个 Electron 窗口，让你能像使用普通桌面应用一样使用它：

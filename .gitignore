@@ -11,6 +11,11 @@ release2/
 dist/
 out/
 
+# 「更新后端」过程中的临时备份（正常结束后会自动清理）
+.nm-scope-bak/
+*.update-bak
+*.bak
+
 # 本地携带的 Node 运行时（体积大，需重新获取时：把本机 node.exe 复制到 vendor/node/node.exe）
 vendor/
 
