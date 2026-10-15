@@ -22,7 +22,7 @@
 >
 > Therefore **this repository is frozen at `v1.2.1` (pinned to dsh `0.2.0-rc.2`) and will receive no further updates.**
 >
-> 👉 **Please use the official desktop app instead:** <https://github.com/deepseek-ai/deepseek-harness>
+> 👉 **Please use the official desktop app instead:** **<https://deepseek.com/harness>** (source & releases: <https://github.com/deepseek-ai/deepseek-harness>)
 >
 > The last built artifact — `DeepSeek-Harness-1.2.1-win-x64.zip`, a fully pinned offline snapshot — is kept in this repository's Releases. See [UPGRADE.md](UPGRADE.md) for the full archive notice, what still works, and how to pick the project up yourself.
 

@@ -47,7 +47,8 @@
 
 ### 四、推荐替代
 
-👉 **请改用官方桌面端：** <https://github.com/deepseek-ai/deepseek-harness>
+👉 **官方桌面端（推荐）：** **<https://deepseek.com/harness>**
+👉 源码与发布：<https://github.com/deepseek-ai/deepseek-harness>
 
 官方桌面端自带 Node 与 pnpm、可管理插件、可一键安装 `dsh` 命令，能力覆盖并超过本项目。
 
@@ -64,7 +65,7 @@
 
 ### 六、致谢
 
-- 界面与后端全部来自官方 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，本项目只提供外壳，未重写任何功能
+- 界面与后端全部来自官方 [DeepSeek Harness](https://deepseek.com/harness)（源码：<https://github.com/deepseek-ai/deepseek-harness>），本项目只提供外壳，未重写任何功能
 - 感谢官方在 `0.2.0-rc.2` 提供了更完整的桌面端方案
 
 ---

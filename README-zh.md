@@ -22,7 +22,7 @@
 >
 > 因此**本仓库冻结在 `v1.2.1`（锁定 dsh `0.2.0-rc.2`），不再进行任何更新。**
 >
-> 👉 **请改用官方桌面端：** <https://github.com/deepseek-ai/deepseek-harness>
+> 👉 **请改用官方桌面端：** **<https://deepseek.com/harness>**（源码与发布：<https://github.com/deepseek-ai/deepseek-harness>）
 >
 > 最后构建的产物 `DeepSeek-Harness-1.2.1-win-x64.zip`（完全锁定依赖的离线快照）保留在本仓库 Releases 中。完整的归档说明、仍可用的能力、以及如何自行接手维护，见 [UPGRADE.md](UPGRADE.md)。
 
